@@ -109,12 +109,34 @@ class GroupCorrectionIn(BaseModel):
         return self
 
 
+class GroupStrandingIn(BaseModel):
+    """现场指挥对一个已出发组的节点滞留报告。"""
+    group_id: int = Field(..., ge=1, description="已出发（含待救援）的人群组编号")
+    node: int = Field(..., ge=0, description="该组按现行计划已到达、尚未进入下一通道的节点")
+    resume_minute: int = Field(..., ge=0,
+                               description="预计恢复通行的分钟（不得早于当前分钟），"
+                                           "新余程从该分钟起规划")
+
+
 class StepOut(BaseModel):
     edge_id: int
     from_node: int
     to_node: int
     enter_minute: int
     exit_minute: int
+
+
+class StrandingInfoOut(BaseModel):
+    """已受理滞留报告的现场信息（当前编排据此区分已走前缀与新余程）。
+
+    ``steps`` 的前 ``prefix_steps`` 段为已走前缀（原样保留），其后为从
+    ``node``、``resume_minute`` 起重新规划的余程；待救援组 ``steps`` 只含
+    已走前缀。
+    """
+    node: int = Field(..., description="滞留/等待所在节点")
+    resume_minute: int = Field(..., description="报告的预计恢复分钟")
+    prefix_steps: int = Field(..., ge=0,
+                              description="已走前缀的段数（steps 中此前段数）")
 
 
 class GroupPlanOut(BaseModel):
@@ -127,6 +149,9 @@ class GroupPlanOut(BaseModel):
     steps: list[StepOut] = Field(default_factory=list)
     reason: Optional[str] = None
     detail: Optional[str] = None
+    stranding: Optional[StrandingInfoOut] = Field(
+        None, description="已受理滞留报告的现场信息（已走前缀/新余程边界）；"
+                          "未报告组为 null")
 
 
 class PlanResponse(BaseModel):
@@ -164,7 +189,8 @@ class RevisionSummaryOut(BaseModel):
     operation: str = Field(
         description="触发操作：scenario=场景重置 | groups=新增人群组 | "
                     "group-corrections=纠正人群组 | closures=登记封闭 | "
-                    "capacity-controls=登记容量管制 | tick=时间推进")
+                    "capacity-controls=登记容量管制 | group-stranding=节点滞留报告 | "
+                    "tick=时间推进")
     minute: int = Field(description="该修订提交后的当前分钟")
     detail: dict = Field(default_factory=dict, description="触发操作的参数摘要")
 

@@ -47,12 +47,17 @@ CREATE TABLE IF NOT EXISTS groups (
     earliest_departure INTEGER NOT NULL,
     priority           INTEGER NOT NULL,
     deadline           INTEGER NOT NULL,
-    status             TEXT NOT NULL,           -- pending | scheduled | fixed | failed
+    status             TEXT NOT NULL,           -- pending | scheduled | fixed | failed | awaiting_rescue
     departure_minute   INTEGER,
     arrival_minute     INTEGER,
     exit_id            INTEGER,
     fail_reason        TEXT,
-    fail_detail        TEXT
+    fail_detail        TEXT,
+    -- 已受理滞留报告的现场信息：等待节点、预计恢复分钟、已走前缀段数；
+    -- 未报告组为 NULL。旧库由 init_db 的幂等迁移补齐列。
+    stranding_node          INTEGER,
+    stranding_resume_minute INTEGER,
+    stranding_prefix_steps  INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS route_steps (
@@ -67,13 +72,14 @@ CREATE TABLE IF NOT EXISTS route_steps (
 );
 
 -- 修订历史：每次成功的编排变更（场景重置/新增组/纠正组/登记封闭/
--- 登记容量管制/推进时间）与编排变更在同一事务内写入；快照为提交时刻的
--- 完整编排 JSON，落库后不再改动、查询时不按当前场景重算。
+-- 登记容量管制/节点滞留报告/推进时间）与编排变更在同一事务内写入；
+-- 快照为提交时刻的完整编排 JSON，落库后不再改动、查询时不按当前场景重算。
 -- 场景重置（reset_db）与服务重启均不影响本表。
 CREATE TABLE IF NOT EXISTS revisions (
     rev         INTEGER PRIMARY KEY,  -- 全局递增修订号（按实际提交顺序）
     operation   TEXT NOT NULL,        -- scenario | groups | group-corrections |
-                                      -- closures | capacity-controls | tick
+                                      -- closures | capacity-controls |
+                                      -- group-stranding | tick
     detail      TEXT NOT NULL,        -- JSON：触发操作的参数摘要
     minute      INTEGER NOT NULL,     -- 该修订提交后的当前分钟
     plan_before TEXT NOT NULL,        -- JSON：提交前完整编排（PlanResponse）
@@ -84,6 +90,16 @@ CREATE TABLE IF NOT EXISTS revisions (
 
 async def init_db(db: aiosqlite.Connection) -> None:
     await db.executescript(SCHEMA)
+    # 旧库（滞留报告功能引入前创建）的 groups 表没有滞留列：幂等补齐
+    async with db.execute("PRAGMA table_info(groups)") as cur:
+        columns = {row[1] for row in await cur.fetchall()}
+    for column, decl in (
+            ("stranding_node", "INTEGER"),
+            ("stranding_resume_minute", "INTEGER"),
+            ("stranding_prefix_steps", "INTEGER")):
+        if column not in columns:
+            await db.execute(
+                f"ALTER TABLE groups ADD COLUMN {column} {decl}")
     await db.execute(
         "INSERT OR IGNORE INTO meta(key, value) VALUES('current_minute', 0)")
     await db.commit()
@@ -251,6 +267,58 @@ async def persist_replan(db: aiosqlite.Connection, results: list[dict],
                    departure_minute=NULL, arrival_minute=NULL, exit_id=NULL,
                    fail_reason=?, fail_detail=? WHERE id=?""",
                 (r["reason"], r["detail"], gid))
+
+
+async def persist_stranding(db: aiosqlite.Connection, group_id: int,
+                            prefix_steps: list[dict], result: dict,
+                            node: int, resume_minute: int) -> None:
+    """受理一次节点滞留报告后落库该组的新编排（调用方负责开启事务）。
+
+    调用方须已删除该组旧路线（释放旧预约）；本函数：
+    * 写回已走前缀（原样保留时刻）；
+    * 新余程规划成功（status='scheduled'）时，追加新余程段，组标记为
+      fixed（已出发组路线固定），新出发分钟沿用原出发分钟；
+    * 新余程无解（status='failed'）时，组标记为 awaiting_rescue（待救援），
+      旧预约不恢复：steps 仅保留已走前缀。
+    """
+    for seq, step in enumerate(prefix_steps):
+        await db.execute(
+            """INSERT INTO route_steps
+               (group_id, seq, edge_id, from_node, to_node,
+                enter_minute, exit_minute)
+               VALUES (?,?,?,?,?,?,?)""",
+            (group_id, seq, step["edge_id"], step["from_node"],
+             step["to_node"], step["enter_minute"], step["exit_minute"]))
+    prefix_count = len(prefix_steps)
+    if result["status"] == "scheduled":
+        await db.execute(
+            """UPDATE groups SET status='fixed',
+               departure_minute=departure_minute,
+               arrival_minute=?, exit_id=?,
+               fail_reason=NULL, fail_detail=NULL,
+               stranding_node=?, stranding_resume_minute=?,
+               stranding_prefix_steps=?
+               WHERE id=?""",
+            (result["arrival_minute"], result["exit_id"],
+             node, resume_minute, prefix_count, group_id))
+        for seq, step in enumerate(result["steps"], start=prefix_count):
+            await db.execute(
+                """INSERT INTO route_steps
+                   (group_id, seq, edge_id, from_node, to_node,
+                    enter_minute, exit_minute)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (group_id, seq, step["edge_id"], step["from_node"],
+                 step["to_node"], step["enter_minute"], step["exit_minute"]))
+    else:
+        await db.execute(
+            """UPDATE groups SET status='awaiting_rescue',
+               arrival_minute=NULL, exit_id=NULL,
+               fail_reason=?, fail_detail=?,
+               stranding_node=?, stranding_resume_minute=?,
+               stranding_prefix_steps=?
+               WHERE id=?""",
+            (result["reason"], result["detail"],
+             node, resume_minute, prefix_count, group_id))
 
 
 # --------------------------------------------------------------------------
