@@ -1,0 +1,18 @@
+services:
+  evacuation:
+    build: .
+    image: evacuation-scheduler:latest
+    container_name: evacuation-scheduler
+    ports:
+      - "8000:8000"
+    environment:
+      # SQLite 数据库路径（容器内）；首次启动且库为空时自动写入演示数据
+      EVAC_DB_PATH: /data/evacuation.db
+      # 启动时是否自动初始化演示数据：true / false
+      EVAC_SEED: "true"
+    volumes:
+      - evac_data:/data
+    restart: unless-stopped
+
+volumes:
+  evac_data:
