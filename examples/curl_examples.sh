@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # 场馆疏散通道编排服务 —— curl 调用示例
 # 用法： bash examples/curl_examples.sh [BASE_URL]
+# 依次演示：初始化、新增组、新增封闭、推进分钟、409 拒绝、容量管制登记/
+# 重叠/超载拒绝、有效上限核验、组纠正、现场节点滞留报告（受理/拒绝/待救援）、
+# 修订追溯。
 set -euo pipefail
 
 BASE="${1:-${BASE:-http://localhost:8000}}"
@@ -106,15 +109,89 @@ curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/group-correcti
   -d '[{"group_id": 7, "size": 18}, {"group_id": 999, "size": 1}]'
 python3 -m json.tool /tmp/resp.json || true
 
-say "18) 列出修订历史（每次成功变更一条，被拒绝的请求不产生）"
+say "18) 重置为便于演示节点滞留报告的小场景，并推进到组1抵达节点2（第4分钟）"
+curl -s -X POST "$BASE/scenario" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "passages": [
+      {"id": 1, "src": 1, "dst": 2, "minutes": 4, "capacity": 10},
+      {"id": 2, "src": 2, "dst": 6, "minutes": 2, "capacity": 10},
+      {"id": 3, "src": 2, "dst": 3, "minutes": 2, "capacity": 10},
+      {"id": 4, "src": 3, "dst": 5, "minutes": 2, "capacity": 10}
+    ],
+    "exits": [5, 6],
+    "closures": [],
+    "groups": [
+      {"id": 1, "size": 10, "origin": 1, "earliest_departure": 0, "priority": 10, "deadline": 30},
+      {"id": 2, "size": 10, "origin": 1, "earliest_departure": 0, "priority": 5, "deadline": 30},
+      {"id": 3, "size": 10, "origin": 2, "earliest_departure": 0, "priority": 1, "deadline": 30}
+    ]
+  }' > /dev/null
+curl -s -X POST "$BASE/tick" -H 'Content-Type: application/json' \
+  -d '{"minutes": 4}' | python3 -m json.tool
+
+say "19) 报告未出发的组 2（节点1，预期 HTTP 409 NOT_DEPARTED，不改编排）"
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/groups/2/delay-report" \
+  -H 'Content-Type: application/json' \
+  -d '{"node_id": 1, "recovery_minute": 4}'
+python3 -m json.tool /tmp/resp.json || true
+
+say "20) 组 1 报告错误节点（实际在节点2，预期 HTTP 409 NODE_MISMATCH）"
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/groups/1/delay-report" \
+  -H 'Content-Type: application/json' \
+  -d '{"node_id": 1, "recovery_minute": 4}'
+python3 -m json.tool /tmp/resp.json || true
+
+say "21) 恢复分钟早于当前分钟（预期 HTTP 422）"
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/groups/1/delay-report" \
+  -H 'Content-Type: application/json' \
+  -d '{"node_id": 2, "recovery_minute": 3}'
+python3 -m json.tool /tmp/resp.json || true
+
+say "22) 正式报告：组1在节点2滞留、预计第7分钟恢复（释放旧预约并重找余程，组2随之重排）"
+curl -s -X POST "$BASE/groups/1/delay-report" \
+  -H 'Content-Type: application/json' \
+  -d '{"node_id": 2, "recovery_minute": 7}' | python3 -m json.tool
+
+say "23) 等价的集合式写法：POST /delay-reports（组号置于请求体；此处演示对组2的409拒绝）"
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/delay-reports" \
+  -H 'Content-Type: application/json' \
+  -d '{"group_id": 2, "node_id": 1, "recovery_minute": 4}'
+python3 -m json.tool /tmp/resp.json || true
+
+say "24) 待救援场景：唯一余程通道自第5分钟封闭，组1报告恢复6 -> awaiting_rescue"
+curl -s -X POST "$BASE/scenario" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "passages": [
+      {"id": 1, "src": 1, "dst": 2, "minutes": 4, "capacity": 10},
+      {"id": 2, "src": 2, "dst": 6, "minutes": 1, "capacity": 10}
+    ],
+    "exits": [6],
+    "closures": [{"edge_id": 2, "start_minute": 5, "end_minute": 30}],
+    "groups": [
+      {"id": 1, "size": 10, "origin": 1, "earliest_departure": 0, "priority": 10, "deadline": 30}
+    ]
+  }' > /dev/null
+curl -s -X POST "$BASE/tick" -H 'Content-Type: application/json' \
+  -d '{"minutes": 4}' > /dev/null
+curl -s -X POST "$BASE/groups/1/delay-report" \
+  -H 'Content-Type: application/json' \
+  -d '{"node_id": 2, "recovery_minute": 6}' | python3 -m json.tool
+
+say "25) 时间推进不自动重排待救援组（仍为 awaiting_rescue，只保留已走前缀）"
+curl -s -X POST "$BASE/tick" -H 'Content-Type: application/json' \
+  -d '{"minutes": 6}' | python3 -m json.tool
+
+say "26) 列出修订历史（节点滞留报告成功各一条 delay-reports，被拒绝的不产生）"
 curl -s "$BASE/revisions" | python3 -m json.tool
 
-say "19) 按修订号查询：当时编排快照 + 各组前后差异（取最新一条，应为 group-corrections）"
+say "27) 按修订号查询：待救援修订的快照与逐组差异（取最新一条）"
 LATEST=$(curl -s "$BASE/revisions" | python3 -c \
   'import json,sys; print(json.load(sys.stdin)["revisions"][-1]["rev"])')
 curl -s "$BASE/revisions/$LATEST" | python3 -m json.tool
 
-say "20) 查询未知修订号（预期 HTTP 404）"
+say "28) 查询未知修订号（预期 HTTP 404）"
 curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' "$BASE/revisions/999999"
 python3 -m json.tool /tmp/resp.json || true
 

@@ -47,7 +47,8 @@ CREATE TABLE IF NOT EXISTS groups (
     earliest_departure INTEGER NOT NULL,
     priority           INTEGER NOT NULL,
     deadline           INTEGER NOT NULL,
-    status             TEXT NOT NULL,           -- pending | scheduled | fixed | failed
+    -- pending | scheduled | fixed | failed | awaiting_rescue
+    status             TEXT NOT NULL,
     departure_minute   INTEGER,
     arrival_minute     INTEGER,
     exit_id            INTEGER,
@@ -66,14 +67,28 @@ CREATE TABLE IF NOT EXISTS route_steps (
     PRIMARY KEY (group_id, seq)
 );
 
+-- 现场节点滞留报告：每个被报告过的组最多一条（UPSERT 覆盖）。
+-- prefix_step_count 为已走前缀步数：route_steps 中 seq < prefix_step_count
+-- 的段落为报告时已经走完、固定保留的前缀；恢复后的余程从该 seq 续编。
+-- 组随后恢复（fixed）或仍待救援（awaiting_rescue）均保留本行，使当前
+-- 编排得以区分"已走前缀"与"新余程"。
+CREATE TABLE IF NOT EXISTS delay_reports (
+    group_id          INTEGER PRIMARY KEY,
+    node_id           INTEGER NOT NULL,
+    recovery_minute   INTEGER NOT NULL,
+    reported_minute   INTEGER NOT NULL,
+    prefix_step_count INTEGER NOT NULL
+);
+
 -- 修订历史：每次成功的编排变更（场景重置/新增组/纠正组/登记封闭/
--- 登记容量管制/推进时间）与编排变更在同一事务内写入；快照为提交时刻的
--- 完整编排 JSON，落库后不再改动、查询时不按当前场景重算。
+-- 登记容量管制/现场节点滞留报告/推进时间）与编排变更在同一事务内写入；
+-- 快照为提交时刻的完整编排 JSON，落库后不再改动、查询时不按当前场景重算。
 -- 场景重置（reset_db）与服务重启均不影响本表。
 CREATE TABLE IF NOT EXISTS revisions (
     rev         INTEGER PRIMARY KEY,  -- 全局递增修订号（按实际提交顺序）
     operation   TEXT NOT NULL,        -- scenario | groups | group-corrections |
-                                      -- closures | capacity-controls | tick
+                                      -- closures | capacity-controls |
+                                      -- delay-reports | tick
     detail      TEXT NOT NULL,        -- JSON：触发操作的参数摘要
     minute      INTEGER NOT NULL,     -- 该修订提交后的当前分钟
     plan_before TEXT NOT NULL,        -- JSON：提交前完整编排（PlanResponse）
@@ -95,8 +110,8 @@ async def reset_db(db: aiosqlite.Connection) -> None:
     修订历史（revisions 表）不在清空之列：场景重置后旧修订仍可查询，
     修订号继续全局递增。
     """
-    for table in ("route_steps", "groups", "closures", "capacity_controls",
-                  "exits", "edges", "meta"):
+    for table in ("delay_reports", "route_steps", "groups", "closures",
+                  "capacity_controls", "exits", "edges", "meta"):
         await db.execute(f"DELETE FROM {table}")
     await db.execute(
         "INSERT INTO meta(key, value) VALUES('current_minute', 0)")
@@ -251,6 +266,49 @@ async def persist_replan(db: aiosqlite.Connection, results: list[dict],
                    departure_minute=NULL, arrival_minute=NULL, exit_id=NULL,
                    fail_reason=?, fail_detail=? WHERE id=?""",
                 (r["reason"], r["detail"], gid))
+
+
+# --------------------------------------------------------------------------
+# 现场节点滞留报告
+# --------------------------------------------------------------------------
+
+async def load_delay_prefixes(db: aiosqlite.Connection) -> dict[int, int]:
+    """返回 group_id -> 已走前缀步数（仅被报告过的组）。"""
+    async with db.execute(
+            "SELECT group_id, prefix_step_count FROM delay_reports") as cur:
+        return {gid: k for gid, k in await cur.fetchall()}
+
+
+async def load_delay_report(db: aiosqlite.Connection,
+                            group_id: int) -> dict | None:
+    async with db.execute(
+            """SELECT group_id, node_id, recovery_minute, reported_minute,
+                      prefix_step_count
+               FROM delay_reports WHERE group_id=?""", (group_id,)) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    return {"group_id": row[0], "node_id": row[1],
+            "recovery_minute": row[2], "reported_minute": row[3],
+            "prefix_step_count": row[4]}
+
+
+async def upsert_delay_report(db: aiosqlite.Connection, *, group_id: int,
+                              node_id: int, recovery_minute: int,
+                              reported_minute: int,
+                              prefix_step_count: int) -> None:
+    """登记/覆盖一组的现场滞留报告（调用方负责事务）。"""
+    await db.execute(
+        """INSERT INTO delay_reports(group_id, node_id, recovery_minute,
+                                     reported_minute, prefix_step_count)
+           VALUES(?,?,?,?,?)
+           ON CONFLICT(group_id) DO UPDATE SET
+               node_id=excluded.node_id,
+               recovery_minute=excluded.recovery_minute,
+               reported_minute=excluded.reported_minute,
+               prefix_step_count=excluded.prefix_step_count""",
+        (group_id, node_id, recovery_minute, reported_minute,
+         prefix_step_count))
 
 
 # --------------------------------------------------------------------------

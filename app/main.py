@@ -3,8 +3,8 @@
 并发安全
 ========
 所有会改变编排结果的请求（初始化场景 / 新增组 / 纠正组 / 新增封闭 /
-登记容量管制 / 推进分钟）由同一把 asyncio 锁串行化，且每个变更在单个
-SQLite 事务内整体提交：
+登记容量管制 / 现场节点滞留报告 / 推进分钟）由同一把 asyncio 锁串行化，
+且每个变更在单个 SQLite 事务内整体提交：
 * 重排未出发组时，先删除这些组的全部旧路线再整体写入新路线，
   不会出现只重排了一部分的中间状态；
 * 容量校验基于"已固定组占用 + 本轮已排入组占用"，锁内逐组累加，
@@ -15,11 +15,15 @@ SQLite 事务内整体提交：
   任一分钟超载，同样整次拒绝（409），不改动任何状态；
 * 纠正人群组时任一项无效（未知组/最终字段不合法/起点非场馆节点），
   或目标组在受理前已因时间推进而出发，整批拒绝（422/409），
-  状态与修订历史不变。
+  状态与修订历史不变；
+* 现场报告节点滞留仅当该组按现行计划已到达该节点、尚未进入下一通道且
+  未抵达出口时受理；报告成功后保留已走前缀及时间，释放该组从当前分钟
+  起的旧预约，从该节点、恢复分钟起重找截止前余程；无余程则标记待救援，
+  不恢复旧预约。其他未出发组随之整体重排，其他已出发组路线与占用不变。
 
 修订历史
 ========
-上述六类变更成功提交时，在同一事务内追加一条修订记录：全局递增修订号、
+上述变更成功提交时，在同一事务内追加一条修订记录：全局递增修订号、
 触发操作、提交后的当前分钟、提交前后完整编排快照（纠正类修订另在
 detail 中逐项记录纠正前后的字段值）。被拒绝的请求（409/422）不产生
 修订。修订记录不随场景重置或服务重启丢失，历史快照按落库内容
@@ -40,10 +44,10 @@ from . import db
 from .planner import effective_capacity, plan_group
 from .schemas import (CapacityControlIn, CapacityControlListOut,
                       CapacityControlOut, ClosureIn, ConflictOut,
-                      GroupChangeOut, GroupCorrectionIn, GroupIn,
-                      GroupPlanOut, PlanResponse, RevisionDetailOut,
-                      RevisionListOut, RevisionSummaryOut, ScenarioIn,
-                      StepOut)
+                      DelayReportAliasIn, DelayReportIn, GroupChangeOut,
+                      GroupCorrectionIn, GroupIn, GroupPlanOut,
+                      PlanResponse, RevisionDetailOut, RevisionListOut,
+                      RevisionSummaryOut, ScenarioIn, StepOut)
 from .seed import SEED_SCENARIO
 
 DB_PATH = os.getenv("EVAC_DB_PATH", "/data/evacuation.db")
@@ -75,9 +79,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="场馆疏散通道编排服务",
-    version="1.1.0",
+    version="1.2.0",
     description="按优先级逐组编排截止前最早到达的疏散路线，"
-                "支持封闭时段、容量管制时段、每分钟容量约束与增量重排。",
+                "支持封闭时段、容量管制时段、每分钟容量约束、增量重排与"
+                "现场节点滞留报告。",
     lifespan=lifespan,
 )
 
@@ -235,11 +240,252 @@ async def _capacity_control_conflicts(conn: aiosqlite.Connection,
 
 
 # --------------------------------------------------------------------------
+# 现场节点滞留报告
+# --------------------------------------------------------------------------
+
+# 余程无解时，面向待救援标记的原因说明（复用既有失败原因码）
+_RESCUE_DETAIL = {
+    "DEADLINE_PASSED":
+        "组自节点 {node} 第 {recovery} 分钟恢复时已晚于截止分钟 {deadline}，"
+        "截止前没有可安排的余程，标记待救援",
+    "BLOCKED_BY_CLOSURE":
+        "组自节点 {node} 第 {recovery} 分钟恢复：忽略封闭后可在截止前到达，"
+        "现有封闭阻断了自该节点出发的全部余程，标记待救援",
+    "INSUFFICIENT_CAPACITY":
+        "组自节点 {node} 第 {recovery} 分钟恢复：忽略容量限制后可在截止前"
+        "到达，现有封闭/限流与其他已出发组的固定占用阻断了截止前全部余程，"
+        "标记待救援",
+    "UNREACHABLE_EXIT":
+        "滞留节点 {node} 与任何出口之间不存在连通路径，标记待救援",
+}
+
+
+async def _delay_report_rejection(conn: aiosqlite.Connection,
+                                  group_id: int, node_id: int,
+                                  recovery_minute: int):
+    """受理前校验。返回 (HTTP 状态码, 错误体)；接受时返回 None。
+
+    仅当该组按现行计划已到达所报节点、尚未进入下一通道且未抵达出口时
+    接受：组未出发、组不在节点（通道中/已抵出口）或节点与报告不符均拒绝。
+    """
+    minute_now = await db.get_current_minute(conn)
+    if recovery_minute < minute_now:
+        raise HTTPException(
+            422, f"恢复分钟 {recovery_minute} 早于当前分钟 {minute_now}")
+
+    async with conn.execute(
+            """SELECT id, status, departure_minute FROM groups
+               WHERE id=?""", (group_id,)) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        raise HTTPException(422, f"人群组 {group_id} 不存在")
+    gid, status, dep_minute = row
+
+    base = {"group_id": group_id, "status": status,
+            "node_id": node_id, "current_minute": minute_now,
+            "recovery_minute": recovery_minute}
+
+    if status not in ("fixed", "awaiting_rescue"):
+        # scheduled / pending / failed：组未出发，不受理且不改编排
+        return 409, {
+            "error": "DELAY_REPORT_NOT_ACCEPTABLE",
+            "message": "该组尚未出发，现场滞留报告不受理，整次拒绝",
+            "conflicts": [{**base, "reason": "NOT_DEPARTED",
+                           "departure_minute": dep_minute}]}
+
+    async with conn.execute(
+            """SELECT seq, edge_id, from_node, to_node, enter_minute,
+                      exit_minute
+               FROM route_steps WHERE group_id=? ORDER BY seq""",
+            (group_id,)) as cur:
+        steps = await cur.fetchall()
+
+    # 待救援组此前已在滞留节点：未排入任何后续通道，时机恒成立，只需节点
+    # 与其报告时的滞留节点一致（重复报告恢复分钟须不早于当前分钟）
+    if status == "awaiting_rescue":
+        report = await db.load_delay_report(conn, group_id)
+        if report is None:  # 防御：状态与报告表不一致不应出现
+            return 409, {
+                "error": "DELAY_REPORT_NOT_ACCEPTABLE",
+                "message": "该组当前没有可复核的滞留位置，整次拒绝",
+                "conflicts": [{**base, "reason": "POSITION_UNKNOWN"}]}
+        at_node = report["node_id"]
+        if node_id != at_node:
+            return 409, {
+                "error": "DELAY_REPORT_NOT_ACCEPTABLE",
+                "message": "报告节点与该组待救援位置不符，整次拒绝",
+                "conflicts": [{**base, "reason": "NODE_MISMATCH",
+                               "expected_node_id": at_node}]}
+        return None
+
+    # status == 'fixed'：按现行计划逐段判断当前位置
+    if not steps:
+        # 零步路线只可能在出口处原地"到达"
+        async with conn.execute("SELECT origin FROM groups WHERE id=?",
+                                (group_id,)) as cur:
+            origin = (await cur.fetchone())[0]
+        return 409, {
+            "error": "DELAY_REPORT_NOT_ACCEPTABLE",
+            "message": "该组已抵达出口，不再接受节点滞留报告，整次拒绝",
+            "conflicts": [{**base, "reason": "ALREADY_AT_EXIT",
+                           "expected_node_id": origin}]}
+
+    # k = 已走完（到达分钟 <= 当前分钟）的连续前缀段数；
+    # 第 k 段（若存在）为"下一通道"
+    k = 0
+    for s in steps:
+        if s[5] <= minute_now:  # exit_minute
+            k += 1
+        else:
+            break
+
+    if k == len(steps):
+        return 409, {
+            "error": "DELAY_REPORT_NOT_ACCEPTABLE",
+            "message": "该组已抵达出口，不再接受节点滞留报告，整次拒绝",
+            "conflicts": [{**base, "reason": "ALREADY_AT_EXIT",
+                           "expected_node_id": steps[-1][3]}]}
+
+    next_step = steps[k]
+    # 进入分钟 == 当前分钟时该组仍可在节点被报告（与 tick 时"出发分钟 ==
+    # 当前分钟仍属未出发"的口径一致）；进入分钟 < 当前分钟则已在通道中
+    if next_step[4] < minute_now:  # enter_minute
+        return 409, {
+            "error": "DELAY_REPORT_NOT_ACCEPTABLE",
+            "message": "该组已进入下一通道、不在节点上，报告时机不符，"
+                       "整次拒绝",
+            "conflicts": [{**base, "reason": "GROUP_IN_TRANSIT",
+                           "edge_id": next_step[1],
+                           "enter_minute": next_step[4],
+                           "exit_minute": next_step[5]}]}
+
+    at_node = next_step[2]  # 下一通道的起点即当前所在节点
+    if node_id != at_node:
+        return 409, {
+            "error": "DELAY_REPORT_NOT_ACCEPTABLE",
+            "message": "报告节点与该组按现行计划所在节点不符，整次拒绝",
+            "conflicts": [{**base, "reason": "NODE_MISMATCH",
+                           "expected_node_id": at_node}]}
+    return None
+
+
+async def _apply_delay_report(conn: aiosqlite.Connection, *,
+                              group_id: int, node_id: int,
+                              recovery_minute: int) -> PlanResponse:
+    """受理并应用一次现场滞留报告（调用方已持锁）。
+
+    与未出发组整体重排、修订记录处于同一事务：
+    * 保留已走前缀（段时间不变），删除并释放该组从当前分钟起的旧预约；
+    * 以所报节点为起点、恢复分钟为最早出发，按现行封闭、限流与其他已出发
+      组的固定占用重找截止前余程（沿用最早到达/出口编号/通道序列择优）；
+    * 有解则组保持 fixed，已走前缀 + 新余程一并作为固定占用；无解则置
+      awaiting_rescue（不恢复旧预约）；
+    * 其他未出发组随后整体重排；其他已出发组路线与占用不变。
+    """
+    minute_now = await db.get_current_minute(conn)
+    rejection = await _delay_report_rejection(
+        conn, group_id, node_id, recovery_minute)
+    if rejection is not None:
+        code, body = rejection
+        return JSONResponse(status_code=code, content=body)
+
+    async with conn.execute(
+            """SELECT size, deadline, status, departure_minute
+               FROM groups WHERE id=?""", (group_id,)) as cur:
+        size, deadline, status, old_dep = await cur.fetchone()
+    # 待救援组重复报告时，前缀步数沿用首次报告的记录
+    if status == "awaiting_rescue":
+        report = await db.load_delay_report(conn, group_id)
+        k = report["prefix_step_count"]
+    else:
+        async with conn.execute(
+                """SELECT COUNT(*) FROM route_steps
+                   WHERE group_id=? AND exit_minute<=?""",
+                (group_id, minute_now)) as cur:
+            k = (await cur.fetchone())[0]
+
+    before = await _build_plan_response(conn)
+    async with db.transaction(conn):
+        # 1) 释放旧预约：删除当前分钟起的余程段，清除未来计划字段；
+        #    组先置 fixed，使稍后 load_world 不把它计入待重排集合
+        await conn.execute(
+            "DELETE FROM route_steps WHERE group_id=? AND seq>=?",
+            (group_id, k))
+        await conn.execute(
+            """UPDATE groups SET status='fixed', arrival_minute=NULL,
+               exit_id=NULL, fail_reason=NULL, fail_detail=NULL
+               WHERE id=?""", (group_id,))
+
+        # 2) 以滞留节点为起点、恢复分钟为最早出发重找余程。此时 world 的
+        #    固定占用含其他已出发组（本组旧余程已删除，不会重复计数）
+        world, _pending = await db.load_world(conn)
+        if recovery_minute > deadline:
+            result = {
+                "group_id": group_id,
+                "status": "failed",
+                "reason": "DEADLINE_PASSED",
+                "detail": "deadline_passed",
+            }
+        else:
+            result = plan_group(
+                group_id=group_id, size=size, origin=node_id,
+                earliest_departure=recovery_minute, deadline=deadline,
+                current_minute=minute_now, world=world)
+
+        if result["status"] == "scheduled":
+            arrival = result["arrival_minute"]
+            exit_id = result["exit_id"]
+            await conn.execute(
+                """UPDATE groups SET status='fixed', departure_minute=?,
+                   arrival_minute=?, exit_id=?, fail_reason=NULL,
+                   fail_detail=NULL WHERE id=?""",
+                (old_dep, arrival, exit_id, group_id))
+            for offset, step in enumerate(result["steps"]):
+                await conn.execute(
+                    """INSERT INTO route_steps
+                       (group_id, seq, edge_id, from_node, to_node,
+                        enter_minute, exit_minute)
+                       VALUES (?,?,?,?,?,?,?)""",
+                    (group_id, k + offset, step["edge_id"],
+                     step["from_node"], step["to_node"],
+                     step["enter_minute"], step["exit_minute"]))
+            outcome = "resumed"
+        else:
+            detail = _RESCUE_DETAIL[result["reason"]].format(
+                node=node_id, recovery=recovery_minute, deadline=deadline)
+            await conn.execute(
+                """UPDATE groups SET status='awaiting_rescue',
+                   arrival_minute=NULL, exit_id=NULL, fail_reason=?,
+                   fail_detail=? WHERE id=?""",
+                (result["reason"], detail, group_id))
+            outcome = "awaiting_rescue"
+
+        await db.upsert_delay_report(
+            conn, group_id=group_id, node_id=node_id,
+            recovery_minute=recovery_minute, reported_minute=minute_now,
+            prefix_step_count=k)
+
+        # 3) 其他未出发组整体重排（本报告组为 fixed/awaiting_rescue，
+        #    不在待重排集合；新余程已落库，load_world 会将其计入固定占用）
+        await _replan_pending(conn, in_transaction=True)
+
+        after = await _build_plan_response(conn)
+        await db.insert_revision(
+            conn, "delay-reports",
+            {"group_id": group_id, "node_id": node_id,
+             "recovery_minute": recovery_minute, "outcome": outcome,
+             "prefix_step_count": k},
+            _plan_dump(before), _plan_dump(after))
+    return after
+
+
+# --------------------------------------------------------------------------
 # 响应组装
 # --------------------------------------------------------------------------
 
 async def _build_plan_response(conn: aiosqlite.Connection) -> PlanResponse:
     minute_now = await db.get_current_minute(conn)
+    prefix_by_group = await db.load_delay_prefixes(conn)
     async with conn.execute(
             """SELECT id, status, departure_minute, arrival_minute, exit_id,
                       fail_reason, fail_detail
@@ -260,6 +506,7 @@ async def _build_plan_response(conn: aiosqlite.Connection) -> PlanResponse:
             group_id=gid, status=status, exit_id=exit_id,
             departure_minute=dep, arrival_minute=arr,
             route=[s.edge_id for s in steps], steps=steps,
+            prefix_step_count=prefix_by_group.get(gid),
             reason=reason, detail=detail))
     return PlanResponse(current_minute=minute_now, groups=out)
 
@@ -271,7 +518,8 @@ def _plan_dump(plan: PlanResponse) -> dict:
 
 # diff 时逐字段比较的分组编排字段（route 由 steps 派生，仍单独列出以便阅读）
 _GROUP_DIFF_FIELDS = ("status", "exit_id", "departure_minute",
-                      "arrival_minute", "route", "steps", "reason", "detail")
+                      "arrival_minute", "route", "steps",
+                      "prefix_step_count", "reason", "detail")
 
 
 def _diff_plans(before: PlanResponse,
@@ -404,13 +652,14 @@ async def correct_groups(corrections: list[GroupCorrectionIn],
             known_nodes |= {row[0] for row in await cur.fetchall()}
 
         # 存在性与"已出发"检查：并发时间推进使目标组在受理前出发时，
-        # 这里读到的即是 fixed，整批拒绝
+        # 这里读到的即是 fixed；已被现场报告置为待救援的组同样已出发，
+        # 均整批拒绝
         departed = []
         for c in corrections:
             row = existing.get(c.group_id)
             if row is None:
                 raise HTTPException(422, f"人群组 {c.group_id} 不存在")
-            if row[6] == "fixed":
+            if row[6] in ("fixed", "awaiting_rescue"):
                 departed.append({"group_id": c.group_id, "status": row[6],
                                  "departure_minute": row[7],
                                  "arrival_minute": row[8]})
@@ -607,6 +856,55 @@ async def list_capacity_controls(request: Request):
             capacity=row[3]) for row in rows])
 
 
+# --------------------------------------------------------------------------
+# 现场节点滞留报告
+# --------------------------------------------------------------------------
+
+@app.post("/groups/{group_id}/delay-report", tags=["现场报告"],
+          response_model=PlanResponse,
+          responses={409: {"description": "组未出发或节点/时机不符，整次拒绝"},
+                     422: {"description": "组不存在或恢复分钟早于当前分钟"}})
+async def report_group_delay(group_id: int, payload: DelayReportIn,
+                             request: Request):
+    """现场指挥按组号、所在节点与预计恢复分钟报告已出发组的节点滞留。
+
+    仅当该组按现行计划**已到达该节点**、**尚未进入下一通道**且**未抵达
+    出口**时受理（待救援组可在其滞留节点重复报告新的恢复分钟）；组未出发
+    （409 ``NOT_DEPARTED``）、节点不符（409 ``NODE_MISMATCH``）、已进入
+    下一通道（409 ``GROUP_IN_TRANSIT``）或已抵出口（409
+    ``ALREADY_AT_EXIT``）均整次拒绝、不改编排；组不存在或恢复分钟早于
+    当前分钟返回 422。
+
+    受理后在同一事务内：保留已走前缀及其时间、释放该组从当前分钟起的旧
+    预约，再依据现有封闭、限流和其他已出发组的固定占用，从该节点、恢复
+    分钟起按既有"最早到达 / 出口编号 / 通道序列"规则寻找截止前余程：
+    有解则组保持 ``fixed``（已走前缀 + 新余程）；无解则标记
+    ``awaiting_rescue`` 并给出原因，不恢复旧预约。其他未出发组随之整体
+    重排，其他已出发组路线与占用不变。成功产生一条 ``delay-reports`` 修订。
+    """
+    conn = request.app.state.db
+    async with request.app.state.lock:
+        return await _apply_delay_report(
+            conn, group_id=group_id, node_id=payload.node_id,
+            recovery_minute=payload.recovery_minute)
+
+
+@app.post("/delay-reports", tags=["现场报告"],
+          response_model=PlanResponse,
+          responses={409: {"description": "组未出发或节点/时机不符，整次拒绝"},
+                     422: {"description": "组不存在或恢复分钟早于当前分钟"}},
+          description="与 POST /groups/{group_id}/delay-report 等价的集合式"
+                      "写法（组号放在请求体内），便于统一批量客户端调用。")
+async def report_group_delay_alias(payload: DelayReportAliasIn,
+                                   request: Request):
+    """集合式节点滞留报告：请求体含 group_id/node_id/recovery_minute。"""
+    conn = request.app.state.db
+    async with request.app.state.lock:
+        return await _apply_delay_report(
+            conn, group_id=payload.group_id, node_id=payload.node_id,
+            recovery_minute=payload.recovery_minute)
+
+
 class TickIn(BaseModel):
     minutes: int = Field(1, gt=0, description="推进的分钟数（正整数）")
 
@@ -617,7 +915,9 @@ async def advance_minute(request: Request, payload: TickIn | None = None):
 
     推进时，旧计划中出发分钟已过（< 新当前分钟）的组视为已经出发，
     路线与占用立即固定、不参与重排；其余未出发组再按新当前分钟整体重排
-    （新计划允许在当前分钟立即出发）。
+    （新计划允许在当前分钟立即出发）。被现场报告置为待救援
+    （awaiting_rescue）的组不参与重排，时间推进不会自动为其寻找余程，
+    只能由新的节点滞留报告携带新的恢复分钟重新受理。
     """
     conn = request.app.state.db
     delta = payload.minutes if payload is not None else 1

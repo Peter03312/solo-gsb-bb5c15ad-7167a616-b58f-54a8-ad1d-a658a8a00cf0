@@ -37,7 +37,13 @@ def summarize(plan):
         if g["status"] in ("scheduled", "fixed"):
             print(f"  组 {g['group_id']:>2} [{g['status']:>9}] "
                   f"出口 {g['exit_id']}  出发 {g['departure_minute']:>3} "
-                  f"到达 {g['arrival_minute']:>3}  通道序列 {g['route']}")
+                  f"到达 {g['arrival_minute']:>3}  通道序列 {g['route']}"
+                  + (f"  已走前缀 {g['prefix_step_count']} 段"
+                     if g.get("prefix_step_count") is not None else ""))
+        elif g["status"] == "awaiting_rescue":
+            print(f"  组 {g['group_id']:>2} [待救援    ] "
+                  f"滞留于已走前缀（{g['prefix_step_count']} 段，"
+                  f"通道序列 {g['route']}）原因 {g['reason']}：{g['detail']}")
         else:
             print(f"  组 {g['group_id']:>2} [{g['status']:>9}] "
                   f"原因 {g['reason']}：{g['detail']}")
@@ -143,6 +149,86 @@ if __name__ == "__main__":
                            [{"group_id": 9, "size": 15},
                             {"group_id": 9, "priority": 3}])
     show("同批组编号重复的纠正批（预期 422）", status, payload)
+
+    # ---- 现场节点滞留报告 ----
+    # 重置为一个便于演示的小场景：组 1 的路线为通道1[0,4)+通道2[4,6)
+    status, plan = call("POST", "/scenario", {
+        "passages": [
+            {"id": 1, "src": 1, "dst": 2, "minutes": 4, "capacity": 10},
+            {"id": 2, "src": 2, "dst": 6, "minutes": 2, "capacity": 10},
+            {"id": 3, "src": 2, "dst": 3, "minutes": 2, "capacity": 10},
+            {"id": 4, "src": 3, "dst": 5, "minutes": 2, "capacity": 10},
+        ],
+        "exits": [5, 6], "closures": [],
+        "groups": [
+            {"id": 1, "size": 10, "origin": 1, "earliest_departure": 0,
+             "priority": 10, "deadline": 30},
+            {"id": 2, "size": 10, "origin": 1, "earliest_departure": 0,
+             "priority": 5, "deadline": 30},
+        ],
+    })
+    assert status == 200
+    # 推进到第 4 分钟：组 1 已到达节点 2（下一通道进入分钟恰为当前分钟，
+    # 仍可在节点被报告）
+    status, plan = call("POST", "/tick", {"minutes": 4})
+    show("推进到第 4 分钟（组 1 已到达节点 2）", status, plan)
+    summarize(plan)
+
+    # 未出发组 / 错误节点 / 恢复分钟在过去：均被拒绝，不改编排
+    status, payload = call("POST", "/groups/2/delay-report",
+                           {"node_id": 1, "recovery_minute": 4})
+    show("报告尚未出发的组 2（预期 409 NOT_DEPARTED）", status, payload)
+    status, payload = call("POST", "/groups/1/delay-report",
+                           {"node_id": 1, "recovery_minute": 4})
+    show("组 1 报告错误节点（实际在节点 2，预期 409 NODE_MISMATCH）",
+         status, payload)
+    status, payload = call("POST", "/groups/1/delay-report",
+                           {"node_id": 2, "recovery_minute": 3})
+    show("恢复分钟早于当前分钟（预期 422）", status, payload)
+
+    # 正式报告：节点 2 滞留，预计第 7 分钟恢复。已走前缀通道1[0,4) 保留，
+    # 旧预约通道2[4,6) 释放，新余程通道2[7,9) 作为固定占用；组 2 随之重排
+    status, plan = call("POST", "/groups/1/delay-report",
+                        {"node_id": 2, "recovery_minute": 7})
+    show("报告组 1 在节点 2 滞留、第 7 分钟恢复（前缀保留+重找余程）",
+         status, plan)
+    summarize(plan)
+    g1 = next(g for g in plan["groups"] if g["group_id"] == 1)
+    print(f"  已走前缀步数 prefix_step_count={g1['prefix_step_count']}："
+          f"steps[0] 已走过固定保留，steps[1] 为恢复后的新余程")
+
+    # 等价的集合式写法（组号放在请求体内）
+    status, payload = call("POST", "/delay-reports",
+                           {"group_id": 2, "node_id": 1,
+                            "recovery_minute": 4})
+    show("集合式写法 /delay-reports（组 2 未出发，预期同样 409）",
+         status, payload)
+
+    # 待救援：唯一余程通道自第 5 分钟封闭，报告恢复 6 -> 无余程
+    status, plan = call("POST", "/scenario", {
+        "passages": [
+            {"id": 1, "src": 1, "dst": 2, "minutes": 4, "capacity": 10},
+            {"id": 2, "src": 2, "dst": 6, "minutes": 1, "capacity": 10},
+        ],
+        "exits": [6],
+        "closures": [{"edge_id": 2, "start_minute": 5,
+                      "end_minute": 30}],
+        "groups": [
+            {"id": 1, "size": 10, "origin": 1, "earliest_departure": 0,
+             "priority": 10, "deadline": 30}],
+    })
+    assert status == 200
+    call("POST", "/tick", {"minutes": 4})
+    status, plan = call("POST", "/groups/1/delay-report",
+                        {"node_id": 2, "recovery_minute": 6})
+    show("报告组 1 恢复 6（余程被封闭阻断，预期 awaiting_rescue）",
+         status, plan)
+    summarize(plan)
+
+    # 后续时间推进不会自动重排待救援组
+    status, plan = call("POST", "/tick", {"minutes": 6})
+    show("再推进 6 分钟（待救援组不自动重排）", status, plan)
+    summarize(plan)
 
     # ---- 修订历史：追溯每次编排变更 ----
     status, payload = call("GET", "/revisions")

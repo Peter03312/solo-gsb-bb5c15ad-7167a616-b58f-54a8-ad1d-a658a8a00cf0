@@ -59,6 +59,18 @@ class CapacityControlListOut(BaseModel):
     controls: list[CapacityControlOut]
 
 
+class DelayReportIn(BaseModel):
+    """现场指挥对单个已出发组的节点滞留报告（组号取自路径参数）。"""
+    node_id: int = Field(..., ge=0, description="组按现行计划已到达、当前滞留的节点编号")
+    recovery_minute: int = Field(
+        ..., ge=0, description="预计恢复分钟（不得早于当前分钟）")
+
+
+class DelayReportAliasIn(DelayReportIn):
+    """节点滞留报告的集合式写法（组号放在请求体内）。"""
+    group_id: int = Field(..., ge=1, description="被报告的已出发人群组编号")
+
+
 class GroupIn(BaseModel):
     id: int = Field(..., ge=1, description="人群组编号（正整数，唯一）")
     size: int = Field(..., gt=0, description="人数（正整数，整组不可拆分）")
@@ -125,6 +137,10 @@ class GroupPlanOut(BaseModel):
     arrival_minute: Optional[int] = None
     route: list[int] = Field(default_factory=list, description="通道编号序列")
     steps: list[StepOut] = Field(default_factory=list)
+    # 仅被现场滞留报告影响过的组（已恢复或待救援）给出：已走前缀步数，
+    # steps[0:prefix_step_count] 为按现行计划已走过、固定保留的前缀；
+    # 其后为报告恢复后重找的新余程。未报告组恒为 null，字段语义保持兼容。
+    prefix_step_count: Optional[int] = None
     reason: Optional[str] = None
     detail: Optional[str] = None
 
@@ -164,7 +180,8 @@ class RevisionSummaryOut(BaseModel):
     operation: str = Field(
         description="触发操作：scenario=场景重置 | groups=新增人群组 | "
                     "group-corrections=纠正人群组 | closures=登记封闭 | "
-                    "capacity-controls=登记容量管制 | tick=时间推进")
+                    "capacity-controls=登记容量管制 | "
+                    "delay-reports=现场报告节点滞留 | tick=时间推进")
     minute: int = Field(description="该修订提交后的当前分钟")
     detail: dict = Field(default_factory=dict, description="触发操作的参数摘要")
 
